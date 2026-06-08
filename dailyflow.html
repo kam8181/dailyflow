@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DailyFlow</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700&family=Outfit:wght@600;800&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #FBF8F4; }
+.block { transition: box-shadow .15s ease; user-select: none; }
+.block:active { cursor: grabbing !important; }
+.block .playBtn { opacity: 0; transition: opacity .15s; }
+.block:hover .playBtn { opacity: 1; }
+input[type="time"]::-webkit-calendar-picker-indicator { opacity:.4; }
+::selection { background:#FDE2E4; }
+@keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.04);} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:translateY(0);} }
+.fadeIn { animation: fadeIn .3s ease forwards; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #DDD0C5; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useRef, useCallback, useEffect } = React;
+
+const SUPABASE_URL = "https://ksbzojvwjeinyhibpyxd.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtzYnpvanZ3amVpbnloaWJweXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA4OTAyOTIsImV4cCI6MjA5NjQ2NjI5Mn0.d-a1UCcGXAyTtOFsQ7C38J_17h1OmgNJkv3gp8vTxio";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const PALETTE = [
+  { bg: "#FDE2E4", bar: "#E76F87", text: "#7A2B3D" },
+  { bg: "#E2ECE9", bar: "#5BA199", text: "#234D47" },
+  { bg: "#E6E0F8", bar: "#8366C9", text: "#3C2D6B" },
+  { bg: "#FFF1D6", bar: "#E0A341", text: "#7A551A" },
+  { bg: "#DCE8FB", bar: "#5B8DEF", text: "#1F3F73" },
+  { bg: "#E4F3E0", bar: "#6BAE4F", text: "#2E5320" },
+];
+const PRIORITY = {
+  high: { label: "高", color: "#E76F87", weight: 0 },
+  mid:  { label: "中", color: "#E0A341", weight: 1 },
+  low:  { label: "低", color: "#5BA199", weight: 2 },
+};
+const DURATION_RULES = [
+  { kw: ["会議","ミーティング","mtg","面談","打ち合わせ","打合せ"], min: 60 },
+  { kw: ["メール","返信","チェック","確認"], min: 20 },
+  { kw: ["作曲","アレンジ","編曲","制作","ミックス","mix"], min: 120 },
+  { kw: ["執筆","記事","ブログ","ライティング","台本","原稿"], min: 90 },
+  { kw: ["勉強","学習","韓国語","リスニング","インプット"], min: 50 },
+  { kw: ["設計","開発","コーディング","実装","デバッグ"], min: 90 },
+  { kw: ["昼食","ランチ","食事","休憩","休息"], min: 45 },
+  { kw: ["運動","ジム","散歩","ランニング"], min: 60 },
+  { kw: ["買い物","掃除","洗濯","家事"], min: 30 },
+  { kw: ["電話","tel","連絡"], min: 15 },
+  { kw: ["資料","提案","企画","プラン","設計書"], min: 75 },
+];
+const NO_POMO = ["昼食","ランチ","食事","休憩","休息","運動","ジム","散歩"];
+
+function estimateDuration(title) {
+  const t = title.toLowerCase();
+  for (const rule of DURATION_RULES)
+    if (rule.kw.some(k => t.includes(k.toLowerCase()))) return { min: rule.min, auto: true };
+  return { min: title.trim().length > 18 ? 60 : 25, auto: true };
+}
+const isPomoTask = title => !NO_POMO.some(k => title.includes(k));
+const toMin = hhmm => { const [h,m] = hhmm.split(":").map(Number); return h*60+m; };
+const toHHMM = min => { const h=Math.floor(min/60)%24, m=((min%60)+60)%60; return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`; };
+const fmtDur = min => { const h=Math.floor(min/60),m=min%60; if(h&&m) return `${h}時間${m}分`; if(h) return `${h}時間`; return `${m}分`; };
+let _id = Date.now();
+const uid = () => `t${_id++}`;
+
+function DailyFlow() {
+  const [tasks, setTasks] = useState([]);
+  const [pomo, setPomo] = useState({ focus:25, short:5, long:15, cycle:4 });
+  const [windows, setWindows] = useState([{ start:"09:00", end:"18:00" }]);
+  const [newTitle, setNewTitle] = useState("");
+  const [scheduled, setScheduled] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saveStatus, setSaveStatus] = useState("");
+  const [timer, setTimer] = useState(null);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [{ data: taskData }, { data: settData }] = await Promise.all([
+          sb.from("tasks").select("*").order("created_at"),
+          sb.from("settings").select("*").eq("id","default").single(),
+        ]);
+        if (taskData && taskData.length > 0) {
+          setTasks(taskData.map(r => ({
+            id: r.id, title: r.title, priority: r.priority,
+            duration: r.duration, autoDuration: r.auto_duration,
+            fixed: r.fixed, fixedStart: r.fixed_start,
+            usePomo: r.use_pomo, color: r.color,
+            done: r.done, placedStart: r.placed_start,
+          })));
+          setScheduled(taskData.some(t => t.placed_start !== null));
+        }
+        if (settData) {
+          if (settData.pomo) setPomo(settData.pomo);
+          if (settData.windows) setWindows(settData.windows);
+        }
+      } catch(e) { console.error(e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  const autoSave = useCallback(async (newTasks, newPomo, newWindows) => {
+    setSaveStatus("saving");
+    try {
+      if (newTasks.length > 0) {
+        await sb.from("tasks").upsert(newTasks.map(t => ({
+          id: t.id, title: t.title, priority: t.priority,
+          duration: t.duration, auto_duration: t.autoDuration,
+          fixed: t.fixed, fixed_start: t.fixedStart,
+          use_pomo: t.usePomo, color: t.color,
+          done: t.done, placed_start: t.placedStart,
+        })));
+        const ids = newTasks.map(t => t.id);
+        const { data: dbTasks } = await sb.from("tasks").select("id");
+        if (dbTasks) {
+          const toDelete = dbTasks.map(r=>r.id).filter(id => !ids.includes(id));
+          if (toDelete.length > 0) await sb.from("tasks").delete().in("id", toDelete);
+        }
+      } else {
+        await sb.from("tasks").delete().neq("id","__none__");
+      }
+      await sb.from("settings").upsert({ id:"default", pomo: newPomo, windows: newWindows, updated_at: new Date().toISOString() });
+      setSaveStatus("saved");
+    } catch(e) { console.error(e); setSaveStatus("error"); }
+  }, []);
+
+  const triggerSave = useCallback((t, p, w) => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => autoSave(t, p, w), 1500);
+  }, [autoSave]);
+
+  const setTasksAndSave = useCallback(updater => {
+    setTasks(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      triggerSave(next, pomo, windows);
+      return next;
+    });
+  }, [pomo, windows, triggerSave]);
+
+  const setPomoAndSave = v => { setPomo(v); triggerSave(tasks, v, windows); };
+  const setWindowsAndSave = v => { setWindows(v); triggerSave(tasks, pomo, v); };
+
+  const addTask = () => {
+    const title = newTitle.trim();
+    if (!title) return;
+    const est = estimateDuration(title);
+    const t = { id:uid(), title, priority:"mid", duration:est.min, autoDuration:est.auto, fixed:false, fixedStart:null, usePomo:isPomoTask(title), color:tasks.length%PALETTE.length, done:false, placedStart:null };
+    setTasksAndSave(p => [...p, t]);
+    setNewTitle("");
+  };
+  const updateTask = (id, patch) => setTasksAndSave(p => p.map(t => t.id===id ? {...t,...patch} : t));
+  const removeTask = id => setTasksAndSave(p => p.filter(t => t.id!==id));
+
+  const pomoLayout = useCallback((durationMin) => {
+    const { focus, short, long, cycle } = pomo;
+    const segs = [];
+    let remaining = durationMin, cursor = 0, pomoCount = 0;
+    while (remaining > 0) {
+      const work = Math.min(focus, remaining);
+      segs.push({ type:"focus", start:cursor, len:work });
+      cursor += work; remaining -= work; pomoCount += 1;
+      if (remaining > 0) {
+        const isLong = pomoCount % cycle === 0;
+        const brk = isLong ? long : short;
+        segs.push({ type: isLong?"long":"short", start:cursor, len:brk });
+        cursor += brk;
+      }
+    }
+    return { segs, total:cursor, pomoCount };
+  }, [pomo]);
+
+  const occupiedLen = useCallback(t => t.usePomo ? pomoLayout(t.duration).total : t.duration, [pomoLayout]);
+
+  const schedule = useCallback(() => {
+    const wins = windows.map(w=>({start:toMin(w.start),end:toMin(w.end)})).filter(w=>w.end>w.start).sort((a,b)=>a.start-b.start);
+    if (!wins.length) return;
+    const placed = {}, occupied = [];
+    tasks.filter(t=>t.fixed&&t.fixedStart&&!t.done).forEach(t => {
+      const s = toMin(t.fixedStart);
+      placed[t.id] = s;
+      occupied.push({ start:s, end:s+occupiedLen(t) });
+    });
+    tasks.filter(t=>!t.done&&!(t.fixed&&t.fixedStart))
+      .sort((a,b)=>{ const pw=PRIORITY[a.priority].weight-PRIORITY[b.priority].weight; return pw!==0?pw:b.duration-a.duration; })
+      .forEach(t => {
+        const need = occupiedLen(t);
+        let best = null;
+        for (const w of wins) {
+          const cands = [w.start,...occupied.map(o=>o.end)].filter(s=>s>=w.start&&s+need<=w.end).sort((a,b)=>a-b);
+          for (const s of cands) {
+            const inWin = wins.some(w=>s>=w.start&&s+need<=w.end);
+            const free = !occupied.some(o=>s<o.end&&s+need>o.start);
+            if (inWin&&free) { best=s; break; }
+          }
+          if (best!==null) break;
+        }
+        if (best!==null) { placed[t.id]=best; occupied.push({start:best,end:best+need}); occupied.sort((a,b)=>a.start-b.start); }
+        else placed[t.id]=null;
+      });
+    const next = tasks.map(t => t.done ? t : {...t, placedStart: placed[t.id]??null});
+    setTasksAndSave(() => next);
+    setScheduled(true);
+  }, [tasks, windows, occupiedLen, setTasksAndSave]);
+
+  const range = useMemo(() => {
+    const wins = windows.map(w=>({s:toMin(w.start),e:toMin(w.end)})).filter(w=>w.e>w.s);
+    if (!wins.length) return {start:540,end:1080};
+    return {start:Math.min(...wins.map(w=>w.s)),end:Math.max(...wins.map(w=>w.e))};
+  }, [windows]);
+  const PX = 1.8;
+  const timelineH = (range.end - range.start) * PX;
+  const ticks = useMemo(() => {
+    const out=[];
+    for(let h=Math.floor(range.start/60);h<=Math.ceil(range.end/60);h++) out.push(h*60);
+    return out.filter(m=>m>=range.start&&m<=range.end);
+  }, [range]);
+  const windowBands = useMemo(()=>windows.map(w=>({s:toMin(w.start),e:toMin(w.end)})).filter(w=>w.e>w.s),[windows]);
+  const placedTasks = useMemo(()=>tasks.filter(t=>t.placedStart!==null&&!t.done).sort((a,b)=>a.placedStart-b.placedStart),[tasks]);
+  const unplaced = useMemo(()=>tasks.filter(t=>t.placedStart===null&&!t.done&&scheduled),[tasks,scheduled]);
+  const conflicts = useMemo(()=>{
+    const set=new Set();
+    for(let i=0;i<placedTasks.length;i++) for(let j=i+1;j<placedTasks.length;j++){
+      const a=placedTasks[i],b=placedTasks[j];
+      if(a.placedStart<b.placedStart+occupiedLen(b)&&b.placedStart<a.placedStart+occupiedLen(a)){set.add(a.id);set.add(b.id);}
+    }
+    return set;
+  }, [placedTasks, occupiedLen]);
+  const totalPomos = useMemo(()=>tasks.filter(t=>!t.done&&t.usePomo).reduce((s,t)=>s+pomoLayout(t.duration).pomoCount,0),[tasks,pomoLayout]);
+
+  const drag = useRef(null);
+  const onDown = (e,t) => {
+    e.preventDefault();
+    const y = e.touches?e.touches[0].clientY:e.clientY;
+    drag.current={id:t.id,startY:y,orig:t.placedStart};
+    window.addEventListener("mousemove",onMove);window.addEventListener("mouseup",onUp);
+    window.addEventListener("touchmove",onMove,{passive:false});window.addEventListener("touchend",onUp);
+  };
+  const onMove = e => {
+    if(!drag.current) return;
+    if(e.cancelable) e.preventDefault();
+    const y=e.touches?e.touches[0].clientY:e.clientY;
+    const d=Math.round((y-drag.current.startY)/PX/5)*5;
+    let ns=Math.max(range.start,Math.min(range.end-5,drag.current.orig+d));
+    updateTask(drag.current.id,{placedStart:ns});
+  };
+  const onUp = () => {
+    if(drag.current){
+      const id=drag.current.id;
+      setTasksAndSave(p=>p.map(t=>{
+        if(t.id!==id||t.placedStart===null) return t;
+        let s=t.placedStart;
+        const need=t.usePomo?pomoLayout(t.duration).total:t.duration;
+        if(s+need>range.end) s=range.end-need;
+        return {...t,placedStart:Math.max(range.start,s)};
+      }));
+    }
+    drag.current=null;
+    window.removeEventListener("mousemove",onMove);window.removeEventListener("mouseup",onUp);
+    window.removeEventListener("touchmove",onMove);window.removeEventListener("touchend",onUp);
+  };
+
+  const stats = useMemo(()=>{
+    const active=tasks.filter(t=>!t.done);
+    return { totalMin:active.reduce((s,t)=>s+occupiedLen(t),0), capacity:windowBands.reduce((s,w)=>s+(w.e-w.s),0), count:active.length, done:tasks.filter(t=>t.done).length };
+  },[tasks,windowBands,occupiedLen]);
+
+  const nowMin = useMemo(()=>{const d=new Date();return d.getHours()*60+d.getMinutes();},[]);
+
+  const startTimer = t => setTimer({taskId:t.id,title:t.title,color:t.color,phase:"focus",secs:pomo.focus*60,total:pomo.focus*60,pomoDone:0,paused:false});
+  useEffect(()=>{
+    if(!timer||timer.paused) return;
+    const iv=setInterval(()=>{
+      setTimer(tm=>{
+        if(!tm||tm.paused) return tm;
+        if(tm.secs>1) return{...tm,secs:tm.secs-1};
+        if(tm.phase==="focus"){
+          const done=tm.pomoDone+1,isLong=done%pomo.cycle===0,len=(isLong?pomo.long:pomo.short)*60;
+          return{...tm,phase:isLong?"long":"short",secs:len,total:len,pomoDone:done};
+        }
+        return{...tm,phase:"focus",secs:pomo.focus*60,total:pomo.focus*60};
+      });
+    },1000);
+    return()=>clearInterval(iv);
+  },[timer,pomo]);
+
+  if (loading) return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",flexDirection:"column",gap:16,fontFamily:"'Zen Maru Gothic',sans-serif",color:"#B79C92"}}>
+      <div style={{fontSize:48}}>🍅</div>
+      <div style={{fontSize:16}}>DailyFlow を読み込み中...</div>
+    </div>
+  );
+
+  return (
+    <div style={S.root}>
+      <header style={S.header}>
+        <div>
+          <div style={S.kicker}>DAILY ORCHESTRATION · POMODORO</div>
+          <h1 style={S.title}>Daily<span style={{color:"#E76F87"}}>Flow</span></h1>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8}}>
+          <div style={S.statBar}>
+            <Stat label="タスク" value={stats.count}/>
+            <Stat label="🍅 ポモ" value={totalPomos}/>
+            <Stat label="占有合計" value={fmtDur(stats.totalMin)} warn={stats.totalMin>stats.capacity}/>
+            <Stat label="稼働枠" value={fmtDur(stats.capacity)}/>
+            <Stat label="完了" value={stats.done}/>
+          </div>
+          <div style={S.saveStatus}>
+            {saveStatus==="saving"&&<span style={{color:"#B79C92"}}>⟳ 保存中...</span>}
+            {saveStatus==="saved"&&<span style={{color:"#5BA199"}}>✓ クラウド保存済み</span>}
+            {saveStatus==="error"&&<span style={{color:"#E76F87"}}>✕ 保存エラー</span>}
+          </div>
+        </div>
+      </header>
+
+      <div style={S.grid}>
+        <section style={S.panel}>
+          <h2 style={S.h2}>🍅 ポモドーロ設定</h2>
+          <div style={S.pomoGrid}>
+            <PomoField label="集中" unit="分" val={pomo.focus} set={v=>setPomoAndSave({...pomo,focus:v})}/>
+            <PomoField label="小休憩" unit="分" val={pomo.short} set={v=>setPomoAndSave({...pomo,short:v})}/>
+            <PomoField label="長休憩" unit="分" val={pomo.long} set={v=>setPomoAndSave({...pomo,long:v})}/>
+            <PomoField label="長休憩まで" unit="回" val={pomo.cycle} set={v=>setPomoAndSave({...pomo,cycle:v})}/>
+          </div>
+          <div style={S.presetRow}>
+            <span style={{fontSize:12,color:"#A99B92"}}>プリセット:</span>
+            <button style={S.preset} onClick={()=>setPomoAndSave({focus:25,short:5,long:15,cycle:4})}>クラシック 25/5</button>
+            <button style={S.preset} onClick={()=>setPomoAndSave({focus:50,short:10,long:20,cycle:2})}>集中型 50/10</button>
+            <button style={S.preset} onClick={()=>setPomoAndSave({focus:90,short:20,long:30,cycle:2})}>ディープ 90/20</button>
+          </div>
+
+          <h2 style={{...S.h2,marginTop:24}}>① 稼働できる時間帯</h2>
+          {windows.map((w,i)=>(
+            <div key={i} style={S.winRow}>
+              <input type="time" value={w.start} onChange={e=>setWindowsAndSave(windows.map((x,j)=>j===i?{...x,start:e.target.value}:x))} style={S.timeInput}/>
+              <span style={S.tilde}>—</span>
+              <input type="time" value={w.end} onChange={e=>setWindowsAndSave(windows.map((x,j)=>j===i?{...x,end:e.target.value}:x))} style={S.timeInput}/>
+              {windows.length>1&&<button style={S.iconBtn} onClick={()=>setWindowsAndSave(windows.filter((_,j)=>j!==i))}>✕</button>}
+            </div>
+          ))}
+          <button style={S.ghostBtn} onClick={()=>setWindowsAndSave([...windows,{start:"19:00",end:"21:00"}])}>＋ 時間帯を追加</button>
+
+          <h2 style={{...S.h2,marginTop:24}}>② 今日のタスク</h2>
+          <div style={S.addRow}>
+            <input value={newTitle} onChange={e=>setNewTitle(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addTask()} placeholder="タスクを入力（例: K-POP記事の執筆）" style={S.textInput}/>
+            <button style={S.addBtn} onClick={addTask}>追加</button>
+          </div>
+          <div style={S.taskList}>
+            {tasks.map(t=><TaskCard key={t.id} t={t} onUpdate={updateTask} onRemove={removeTask} pomoLayout={pomoLayout}/>)}
+          </div>
+          <button style={S.primaryBtn} onClick={schedule}>⚡ ポモドーロ単位でタイムラインに配置</button>
+        </section>
+
+        <section style={S.panel}>
+          <div style={S.tlHeader}>
+            <h2 style={S.h2}>③ タイムライン</h2>
+            {scheduled&&<span style={S.hint}>ドラッグで再配置 ／ ▶で集中スタート</span>}
+          </div>
+          {!scheduled?(
+            <div style={S.empty}>
+              <div style={{fontSize:40,marginBottom:12}}>🍅</div>
+              タスクと時間帯を入力して<br/>「タイムラインに配置」を押してください
+            </div>
+          ):(
+            <>
+              {unplaced.length>0&&<div style={S.warnBox}>⚠ 稼働枠に収まらないタスクが {unplaced.length} 件あります（{unplaced.map(t=>t.title).join("、")}）。</div>}
+              <div style={S.timelineWrap}>
+                <div style={{...S.timeline,height:timelineH}}>
+                  {windowBands.map((w,i)=>(
+                    <div key={i} style={{position:"absolute",left:64,right:8,top:(w.s-range.start)*PX,height:(w.e-w.s)*PX,background:"repeating-linear-gradient(45deg,#F7F3EF,#F7F3EF 10px,#F2ECE6 10px,#F2ECE6 20px)",borderRadius:10,zIndex:0}}/>
+                  ))}
+                  {ticks.map(m=>(
+                    <div key={m} style={{position:"absolute",top:(m-range.start)*PX,left:0,right:0,borderTop:"1px solid #EadFd5",zIndex:1}}>
+                      <span style={S.tickLabel}>{toHHMM(m)}</span>
+                    </div>
+                  ))}
+                  {nowMin>=range.start&&nowMin<=range.end&&(
+                    <div style={{position:"absolute",top:(nowMin-range.start)*PX,left:56,right:8,height:2,background:"#E76F87",zIndex:6}}>
+                      <span style={S.nowDot}/>
+                    </div>
+                  )}
+                  {placedTasks.map(t=>{
+                    const top=(t.placedStart-range.start)*PX;
+                    const p=PALETTE[t.color];
+                    const isConf=conflicts.has(t.id);
+                    const layout=t.usePomo?pomoLayout(t.duration):{segs:[{type:"focus",start:0,len:t.duration}],total:t.duration,pomoCount:0};
+                    return(
+                      <div key={t.id} className="block" onMouseDown={e=>onDown(e,t)} onTouchStart={e=>onDown(e,t)}
+                        style={{position:"absolute",top,left:64,right:8,height:Math.max(layout.total*PX,28),zIndex:3,cursor:"grab",borderRadius:10,
+                          boxShadow:isConf?"0 0 0 2px #E76F87,0 6px 16px rgba(231,111,135,.25)":"0 4px 12px rgba(60,45,40,.08)",overflow:"hidden",background:"#fff"}}>
+                        {layout.segs.map((seg,si)=>(
+                          <div key={si} style={{position:"absolute",left:0,right:0,top:seg.start*PX,height:seg.len*PX,
+                            background:seg.type==="focus"?p.bg:seg.type==="long"?"#EFEAE4":"#F5F1EC",
+                            borderLeft:`4px solid ${seg.type==="focus"?p.bar:"#D8CFC6"}`,
+                            borderTop:si>0?"1px dashed rgba(0,0,0,.08)":"none"}}>
+                            {seg.type!=="focus"&&seg.len*PX>14&&(
+                              <span style={S.breakLabel}>☕ {seg.type==="long"?"長":""}休憩 {seg.len}分</span>
+                            )}
+                          </div>
+                        ))}
+                        <div style={{position:"absolute",left:12,right:8,top:5,color:p.text}}>
+                          <div style={S.blockTitle}>
+                            {t.fixed&&"📌 "}{t.title}
+                            {t.usePomo&&layout.pomoCount>0&&<span style={S.pomoTag}>🍅×{layout.pomoCount}</span>}
+                            {isConf&&<span style={S.confTag}>重複</span>}
+                          </div>
+                          <div style={S.blockMeta}>{toHHMM(t.placedStart)}–{toHHMM(t.placedStart+layout.total)} ・ 集中{fmtDur(t.duration)}</div>
+                        </div>
+                        {t.usePomo&&(
+                          <button className="playBtn" style={S.playBtn}
+                            onMouseDown={e=>e.stopPropagation()} onTouchStart={e=>e.stopPropagation()}
+                            onClick={e=>{e.stopPropagation();startTimer(t);}}>▶</button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+
+      {timer&&(
+        <div style={{...S.timerCard,background:timer.phase==="focus"?"linear-gradient(135deg,#3C2D2A,#5A4540)":"linear-gradient(135deg,#5BA199,#4A857E)"}}>
+          <div style={S.timerTop}>
+            <span style={S.timerPhase}>{timer.phase==="focus"?"🍅 集中中":timer.phase==="long"?"🌴 長休憩":"☕ 小休憩"}</span>
+            <button style={S.timerClose} onClick={()=>setTimer(null)}>✕</button>
+          </div>
+          <div style={S.timerTitle}>{timer.title}</div>
+          <div style={S.timerClock}>{String(Math.floor(timer.secs/60)).padStart(2,"0")}:{String(timer.secs%60).padStart(2,"0")}</div>
+          <div style={S.timerBarBg}><div style={{...S.timerBarFill,width:`${(1-timer.secs/timer.total)*100}%`}}/></div>
+          <div style={S.timerFooter}>
+            <span>完了: {timer.pomoDone} 🍅</span>
+            <button style={S.timerPause} onClick={()=>setTimer(tm=>({...tm,paused:!tm.paused}))}>{timer.paused?"▶ 再開":"⏸ 停止"}</button>
+          </div>
+        </div>
+      )}
+
+      <footer style={S.footer}>DailyFlow — クラウド同期 × ポモドーロ自動分割 × タイムブロッキング</footer>
+    </div>
+  );
+}
+
+function TaskCard({t,onUpdate,onRemove,pomoLayout}){
+  const [editDur,setEditDur]=useState(false);
+  const p=PALETTE[t.color];
+  const pc=t.usePomo?pomoLayout(t.duration).pomoCount:0;
+  return(
+    <div style={{...S.card,opacity:t.done?0.5:1,borderLeft:`4px solid ${p.bar}`}}>
+      <button style={{...S.check,background:t.done?p.bar:"transparent",borderColor:p.bar}} onClick={()=>onUpdate(t.id,{done:!t.done})}>{t.done?"✓":""}</button>
+      <div style={{flex:1,minWidth:0}}>
+        <input value={t.title} onChange={e=>onUpdate(t.id,{title:e.target.value})} style={{...S.cardTitle,textDecoration:t.done?"line-through":"none"}}/>
+        <div style={S.cardMeta}>
+          <div style={S.prioGroup}>
+            {Object.entries(PRIORITY).map(([k,v])=>(
+              <button key={k} onClick={()=>onUpdate(t.id,{priority:k})} style={{...S.prioBtn,background:t.priority===k?v.color:"#fff",color:t.priority===k?"#fff":"#9A918C",borderColor:t.priority===k?v.color:"#E5DDD5"}}>{v.label}</button>
+            ))}
+          </div>
+          {editDur?(
+            <input type="number" min={5} step={5} value={t.duration} autoFocus onChange={e=>onUpdate(t.id,{duration:Math.max(5,Number(e.target.value)||5),autoDuration:false})} onBlur={()=>setEditDur(false)} onKeyDown={e=>e.key==="Enter"&&setEditDur(false)} style={S.durInput}/>
+          ):(
+            <button style={S.durChip} onClick={()=>setEditDur(true)}>
+              {fmtDur(t.duration)}{t.autoDuration&&<span style={S.autoTag}>自動</span>}
+            </button>
+          )}
+          <button style={{...S.pomoToggle,background:t.usePomo?"#E76F87":"#fff",color:t.usePomo?"#fff":"#9A918C",borderColor:t.usePomo?"#E76F87":"#E5DDD5"}} onClick={()=>onUpdate(t.id,{usePomo:!t.usePomo})}>🍅{t.usePomo&&pc>0?`×${pc}`:""}</button>
+          <button style={{...S.fixBtn,background:t.fixed?"#3C2D2A":"#fff",color:t.fixed?"#fff":"#9A918C"}} onClick={()=>onUpdate(t.id,{fixed:!t.fixed,fixedStart:!t.fixed?t.fixedStart||"13:00":null})}>📌</button>
+          {t.fixed&&<input type="time" value={t.fixedStart||"13:00"} onChange={e=>onUpdate(t.id,{fixedStart:e.target.value})} style={S.fixTime}/>}
+        </div>
+      </div>
+      <button style={S.del} onClick={()=>onRemove(t.id)}>✕</button>
+    </div>
+  );
+}
+
+function PomoField({label,unit,val,set}){
+  return(
+    <div style={S.pomoField}>
+      <label style={S.pomoLabel}>{label}</label>
+      <div style={S.pomoInputWrap}>
+        <input type="number" min={1} value={val} onChange={e=>set(Math.max(1,Number(e.target.value)||1))} style={S.pomoInput}/>
+        <span style={S.pomoUnit}>{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function Stat({label,value,warn}){
+  return(
+    <div style={S.statItem}>
+      <div style={{...S.statVal,color:warn?"#E76F87":"#3C2D2A"}}>{value}</div>
+      <div style={S.statLabel}>{label}</div>
+    </div>
+  );
+}
+
+const S={
+  root:{fontFamily:"'Zen Maru Gothic',sans-serif",background:"radial-gradient(1200px 600px at 80% -10%,#FCEEF0 0%,transparent 60%),radial-gradient(900px 500px at -10% 110%,#E6F0EC 0%,transparent 55%),#FBF8F4",minHeight:"100vh",color:"#3C2D2A",padding:"28px clamp(16px,4vw,48px)"},
+  header:{display:"flex",justifyContent:"space-between",alignItems:"flex-end",flexWrap:"wrap",gap:20,marginBottom:26},
+  kicker:{fontFamily:"'Outfit',sans-serif",fontSize:12,letterSpacing:"0.28em",color:"#B79C92",fontWeight:600},
+  title:{fontFamily:"'Outfit',sans-serif",fontSize:"clamp(34px,5vw,52px)",fontWeight:800,margin:"2px 0 0",letterSpacing:"-0.02em"},
+  statBar:{display:"flex",gap:4,background:"rgba(255,255,255,.7)",backdropFilter:"blur(8px)",border:"1px solid #EFE6DD",borderRadius:16,padding:"10px 8px",boxShadow:"0 8px 24px rgba(120,90,70,.07)"},
+  statItem:{textAlign:"center",padding:"0 10px",minWidth:58},
+  statVal:{fontFamily:"'Outfit',sans-serif",fontSize:17,fontWeight:800},
+  statLabel:{fontSize:10,color:"#A99B92",marginTop:2},
+  saveStatus:{fontSize:12,height:18},
+  grid:{display:"grid",gridTemplateColumns:"minmax(320px,1fr) minmax(320px,1.05fr)",gap:22,alignItems:"start"},
+  panel:{background:"rgba(255,255,255,.78)",backdropFilter:"blur(10px)",border:"1px solid #EFE6DD",borderRadius:22,padding:"22px clamp(16px,2vw,24px)",boxShadow:"0 12px 40px rgba(120,90,70,.08)"},
+  h2:{fontSize:15,fontWeight:700,margin:"0 0 14px",display:"flex",alignItems:"center",gap:8},
+  pomoGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8},
+  pomoField:{display:"flex",flexDirection:"column",gap:4},
+  pomoLabel:{fontSize:11,color:"#A99B92"},
+  pomoInputWrap:{display:"flex",alignItems:"center",border:"1px solid #E5DDD5",borderRadius:9,background:"#fff",padding:"0 8px"},
+  pomoInput:{width:"100%",border:"none",outline:"none",fontFamily:"'Outfit',sans-serif",fontSize:15,fontWeight:600,padding:"8px 0",background:"transparent",color:"#3C2D2A"},
+  pomoUnit:{fontSize:11,color:"#B79C92"},
+  presetRow:{display:"flex",flexWrap:"wrap",alignItems:"center",gap:6,marginTop:10},
+  preset:{fontFamily:"inherit",fontSize:11.5,border:"1px solid #E5DDD5",background:"#fff",color:"#7A6A60",borderRadius:20,padding:"5px 11px",cursor:"pointer"},
+  winRow:{display:"flex",alignItems:"center",gap:8,marginBottom:8},
+  timeInput:{fontFamily:"'Outfit',sans-serif",fontSize:15,padding:"8px 10px",border:"1px solid #E5DDD5",borderRadius:10,background:"#fff",color:"#3C2D2A"},
+  tilde:{color:"#B79C92"},
+  iconBtn:{border:"none",background:"#F3ECE5",color:"#9A918C",borderRadius:8,width:30,height:30,cursor:"pointer"},
+  ghostBtn:{width:"100%",border:"1.5px dashed #DCD0C5",background:"transparent",color:"#A8917F",padding:"9px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"inherit",marginTop:2},
+  addRow:{display:"flex",gap:8,marginBottom:14},
+  textInput:{flex:1,fontFamily:"inherit",fontSize:14,padding:"11px 14px",border:"1px solid #E5DDD5",borderRadius:12,background:"#fff",color:"#3C2D2A"},
+  addBtn:{fontFamily:"inherit",fontWeight:700,background:"#3C2D2A",color:"#fff",border:"none",borderRadius:12,padding:"0 18px",cursor:"pointer"},
+  taskList:{display:"flex",flexDirection:"column",gap:9},
+  card:{display:"flex",gap:10,alignItems:"flex-start",background:"#fff",border:"1px solid #EFE6DD",borderRadius:14,padding:"12px 12px 12px 14px"},
+  check:{flexShrink:0,width:22,height:22,borderRadius:7,border:"2px solid",color:"#fff",cursor:"pointer",marginTop:2,fontSize:12,lineHeight:1},
+  cardTitle:{width:"100%",border:"none",background:"transparent",fontFamily:"inherit",fontSize:14.5,fontWeight:700,color:"#3C2D2A",padding:0,marginBottom:8,outline:"none"},
+  cardMeta:{display:"flex",flexWrap:"wrap",alignItems:"center",gap:6},
+  prioGroup:{display:"flex",gap:3},
+  prioBtn:{width:26,height:24,borderRadius:7,border:"1px solid",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700},
+  durChip:{display:"inline-flex",alignItems:"center",gap:4,border:"1px solid #E5DDD5",background:"#FBF8F4",borderRadius:8,padding:"4px 9px",cursor:"pointer",fontFamily:"inherit",fontSize:12.5,color:"#6B6360"},
+  autoTag:{fontSize:9,background:"#5BA199",color:"#fff",borderRadius:4,padding:"1px 4px"},
+  durInput:{width:70,fontFamily:"inherit",fontSize:13,padding:"4px 8px",border:"1px solid #5BA199",borderRadius:8},
+  pomoToggle:{border:"1px solid",borderRadius:8,padding:"4px 9px",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700},
+  fixBtn:{border:"1px solid #E5DDD5",borderRadius:8,padding:"4px 9px",cursor:"pointer",fontFamily:"inherit",fontSize:12},
+  fixTime:{fontFamily:"'Outfit',sans-serif",fontSize:12.5,padding:"3px 6px",border:"1px solid #E5DDD5",borderRadius:8},
+  del:{flexShrink:0,border:"none",background:"transparent",color:"#CDB9AD",cursor:"pointer",fontSize:14},
+  primaryBtn:{width:"100%",marginTop:18,fontFamily:"inherit",fontWeight:700,fontSize:15,color:"#fff",background:"linear-gradient(120deg,#E76F87,#E0A341)",border:"none",borderRadius:14,padding:"14px",cursor:"pointer",boxShadow:"0 10px 24px rgba(231,111,135,.3)"},
+  tlHeader:{display:"flex",justifyContent:"space-between",alignItems:"baseline",flexWrap:"wrap",gap:8},
+  hint:{fontSize:11.5,color:"#B79C92"},
+  empty:{textAlign:"center",color:"#B79C92",padding:"70px 20px",fontSize:14,lineHeight:1.7},
+  warnBox:{background:"#FDE2E4",color:"#7A2B3D",borderRadius:12,padding:"10px 14px",fontSize:12.5,marginBottom:12,lineHeight:1.6},
+  timelineWrap:{maxHeight:"70vh",overflowY:"auto",paddingRight:4},
+  timeline:{position:"relative",marginTop:4},
+  tickLabel:{position:"absolute",left:0,top:-8,fontSize:11,fontFamily:"'Outfit',sans-serif",color:"#B79C92",background:"#FBF8F4",paddingRight:4},
+  nowDot:{position:"absolute",left:-5,top:-4,width:10,height:10,borderRadius:"50%",background:"#E76F87"},
+  blockTitle:{fontSize:13,fontWeight:700,display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
+  pomoTag:{fontSize:9.5,background:"#E76F87",color:"#fff",borderRadius:4,padding:"1px 5px",flexShrink:0},
+  confTag:{fontSize:9.5,background:"#E76F87",color:"#fff",borderRadius:4,padding:"1px 5px"},
+  blockMeta:{fontSize:10.5,fontFamily:"'Outfit',sans-serif",opacity:0.8,marginTop:2},
+  breakLabel:{fontSize:9.5,color:"#A8978B",fontFamily:"'Outfit',sans-serif",position:"absolute",right:10,top:"50%",transform:"translateY(-50%)"},
+  playBtn:{position:"absolute",right:8,bottom:8,width:28,height:28,borderRadius:"50%",border:"none",background:"rgba(255,255,255,.85)",color:"#E76F87",cursor:"pointer",fontSize:11,boxShadow:"0 2px 8px rgba(0,0,0,.15)",zIndex:4},
+  timerCard:{position:"fixed",right:24,bottom:24,width:260,borderRadius:20,padding:18,color:"#fff",boxShadow:"0 16px 48px rgba(0,0,0,.3)",zIndex:50,animation:"pulse 4s ease-in-out infinite"},
+  timerTop:{display:"flex",justifyContent:"space-between",alignItems:"center"},
+  timerPhase:{fontSize:13,fontWeight:700,letterSpacing:".04em"},
+  timerClose:{border:"none",background:"rgba(255,255,255,.2)",color:"#fff",borderRadius:6,width:24,height:24,cursor:"pointer"},
+  timerTitle:{fontSize:12,opacity:0.85,marginTop:4,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
+  timerClock:{fontFamily:"'Outfit',sans-serif",fontSize:48,fontWeight:800,textAlign:"center",margin:"8px 0",letterSpacing:"-0.02em"},
+  timerBarBg:{height:6,background:"rgba(255,255,255,.25)",borderRadius:3,overflow:"hidden"},
+  timerBarFill:{height:"100%",background:"#fff",borderRadius:3,transition:"width 1s linear"},
+  timerFooter:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:12,fontSize:12},
+  timerPause:{border:"1px solid rgba(255,255,255,.4)",background:"transparent",color:"#fff",borderRadius:20,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit",fontSize:12},
+  footer:{textAlign:"center",color:"#C3B3A8",fontSize:11.5,marginTop:26},
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DailyFlow/>);
+</script>
+</body>
+</html>
