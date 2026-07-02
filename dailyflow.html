@@ -20,7 +20,6 @@ body { background: #FBF8F4; }
 input[type="time"]::-webkit-calendar-picker-indicator { opacity:.4; }
 ::selection { background:#FDE2E4; }
 @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.04);} }
-@keyframes fadeIn { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:translateY(0);} }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #DDD0C5; border-radius: 3px; }
@@ -44,9 +43,9 @@ const PALETTE = [
   { bg: "#E4F3E0", bar: "#6BAE4F", text: "#2E5320" },
 ];
 const PRIORITY = {
-  high: { label: "高", color: "#E76F87", weight: 0 },
-  mid:  { label: "中", color: "#E0A341", weight: 1 },
-  low:  { label: "低", color: "#5BA199", weight: 2 },
+  high: { label: "高", color: "#E76F87" },
+  mid:  { label: "中", color: "#E0A341" },
+  low:  { label: "低", color: "#5BA199" },
 };
 const DURATION_RULES = [
   { kw: ["会議","ミーティング","mtg","面談","打ち合わせ","打合せ"], min: 60 },
@@ -63,6 +62,10 @@ const DURATION_RULES = [
 ];
 const NO_POMO = ["昼食","ランチ","食事","休憩","休息","運動","ジム","散歩"];
 
+// タイムライン基準: 7:00始まり = 420分。以降420〜1860(翌7:00)で表現。
+const TL_START = 420;      // 07:00
+const TL_END = 420 + 1440; // 翌07:00 = 1860
+
 function estimateDuration(title) {
   const t = title.toLowerCase();
   for (const rule of DURATION_RULES)
@@ -71,7 +74,9 @@ function estimateDuration(title) {
 }
 const isPomoTask = title => !NO_POMO.some(k => title.includes(k));
 const toMin = hhmm => { const [h,m] = hhmm.split(":").map(Number); return h*60+m; };
-const toHHMM = min => { const h=Math.floor(min/60)%24, m=((min%60)+60)%60; return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`; };
+// 通常の分(0-1439) → タイムライン座標(420-1860)。7時未満は翌日側へ。
+const toTL = clockMin => clockMin < TL_START ? clockMin + 1440 : clockMin;
+const toHHMM = tlMin => { const c=((tlMin%1440)+1440)%1440; const h=Math.floor(c/60), m=c%60; return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`; };
 const fmtDur = min => { const h=Math.floor(min/60),m=min%60; if(h&&m) return `${h}時間${m}分`; if(h) return `${h}時間`; return `${m}分`; };
 let _id = Date.now();
 const uid = () => `t${_id++}`;
@@ -81,22 +86,38 @@ function DailyFlow() {
   const [pomo, setPomo] = useState({ focus:25, short:5, long:30, cycle:4 });
   const [windows, setWindows] = useState([{ start:"09:00", end:"18:00" }]);
   const [newTitle, setNewTitle] = useState("");
-  const [scheduled, setScheduled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState("");
   const [timer, setTimer] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
-  const [mobileTab, setMobileTab] = useState("edit"); // edit | timeline
+  const [tab, setTab] = useState("timeline"); // edit | timeline | later
   const [isComposing, setIsComposing] = useState(false);
   const saveTimer = useRef(null);
 
-  // 画面幅判定
   const [isMobile, setIsMobile] = useState(window.innerWidth < 860);
   useEffect(() => {
     const h = () => setIsMobile(window.innerWidth < 860);
     window.addEventListener("resize", h);
     return () => window.removeEventListener("resize", h);
   }, []);
+
+  const pomoLayout = useCallback((durationMin) => {
+    const { focus, short, long, cycle } = pomo;
+    const segs = []; let remaining = durationMin, cursor = 0, pomoCount = 0;
+    while (remaining > 0) {
+      const work = Math.min(focus, remaining);
+      segs.push({ type:"focus", start:cursor, len:work });
+      cursor += work; remaining -= work; pomoCount += 1;
+      if (remaining > 0) {
+        const isLong = pomoCount % cycle === 0;
+        const brk = isLong ? long : short;
+        segs.push({ type: isLong?"long":"short", start:cursor, len:brk });
+        cursor += brk;
+      }
+    }
+    return { segs, total:cursor, pomoCount };
+  }, [pomo]);
+  const occupiedLen = useCallback(t => t.usePomo ? pomoLayout(t.duration).total : t.duration, [pomoLayout]);
 
   useEffect(() => {
     (async () => {
@@ -105,16 +126,15 @@ function DailyFlow() {
           sb.from("tasks").select("*").order("created_at"),
           sb.from("settings").select("*").eq("id","default").single(),
         ]);
-        if (taskData && taskData.length > 0) {
+        if (taskData) {
           setTasks(taskData.map(r => ({
             id: r.id, title: r.title, priority: r.priority,
             duration: r.duration, autoDuration: r.auto_duration,
             fixed: r.fixed, fixedStart: r.fixed_start,
             usePomo: r.use_pomo, color: r.color,
             done: r.done, placedStart: r.placed_start,
-            lane: r.lane || 0,
+            lane: r.lane || 0, status: r.status || "today",
           })));
-          setScheduled(taskData.some(t => t.placed_start !== null));
         }
         if (settData) {
           if (settData.pomo) setPomo({ focus:25, short:5, long:30, cycle:4, ...settData.pomo });
@@ -134,7 +154,7 @@ function DailyFlow() {
           duration: t.duration, auto_duration: t.autoDuration,
           fixed: t.fixed, fixed_start: t.fixedStart,
           use_pomo: t.usePomo, color: t.color,
-          done: t.done, placed_start: t.placedStart, lane: t.lane||0,
+          done: t.done, placed_start: t.placedStart, lane: t.lane||0, status: t.status||"today",
         })));
         const ids = newTasks.map(t => t.id);
         const { data: dbTasks } = await sb.from("tasks").select("id");
@@ -149,12 +169,10 @@ function DailyFlow() {
       setSaveStatus("saved");
     } catch(e) { console.error(e); setSaveStatus("error"); }
   }, []);
-
   const triggerSave = useCallback((t, p, w) => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => autoSave(t, p, w), 1200);
   }, [autoSave]);
-
   const setTasksAndSave = useCallback(updater => {
     setTasks(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
@@ -162,91 +180,67 @@ function DailyFlow() {
       return next;
     });
   }, [pomo, windows, triggerSave]);
-
   const setPomoAndSave = v => { setPomo(v); triggerSave(tasks, v, windows); };
   const setWindowsAndSave = v => { setWindows(v); triggerSave(tasks, pomo, v); };
 
-  const addTask = () => {
+  // 稼働時間帯（タイムライン座標）
+  const windowBands = useMemo(()=>windows
+    .map(w=>({s:toTL(toMin(w.start)),e:toTL(toMin(w.end))}))
+    .map(w=>w.e<=w.s?{s:w.s,e:w.e+1440}:w) // 終了が開始以下なら日跨ぎ
+    .filter(w=>w.e>w.s)
+    .sort((a,b)=>a.s-b.s),[windows]);
+
+  // ===== 新規タスクを稼働時間帯の末尾に積む =====
+  const nextSlotStart = useCallback((currentTasks, need) => {
+    if (!windowBands.length) return null;
+    // 既存の today 配置ブロック(lane0のみ基準)から埋まっている終端を求める
+    const placed = currentTasks.filter(t=>t.status==="today"&&t.placedStart!==null&&!t.done&&(t.lane||0)===0)
+      .map(t=>({s:t.placedStart,e:t.placedStart+occupiedLen(t)}));
+    for (const w of windowBands) {
+      // この枠内で埋まっている最後の終端
+      let cursor = w.s;
+      const inWin = placed.filter(p=>p.e>w.s&&p.s<w.e).sort((a,b)=>a.s-b.s);
+      inWin.forEach(p=>{ if(p.e>cursor) cursor = Math.max(cursor,p.e); });
+      if (cursor + need <= w.e) return cursor;
+    }
+    // どこにも入らなければ最後の枠の末尾（はみ出し扱い）
+    return null;
+  }, [windowBands, occupiedLen]);
+
+  const addTask = (status="today") => {
     const title = newTitle.trim();
     if (!title) return;
     const est = estimateDuration(title);
-    const t = { id:uid(), title, priority:"mid", duration:est.min, autoDuration:est.auto, fixed:false, fixedStart:null, usePomo:isPomoTask(title), color:tasks.length%PALETTE.length, done:false, placedStart:null, lane:0 };
-    setTasksAndSave(p => [...p, t]);
+    const base = { id:uid(), title, priority:"mid", duration:est.min, autoDuration:est.auto, fixed:false, fixedStart:null, usePomo:isPomoTask(title), color:tasks.length%PALETTE.length, done:false, lane:0, status };
+    if (status==="later") {
+      setTasksAndSave(p => [...p, {...base, placedStart:null}]);
+    } else {
+      const need = est.auto ? (isPomoTask(title)?pomoLayout(est.min).total:est.min) : est.min;
+      const slot = nextSlotStart(tasks, need);
+      setTasksAndSave(p => [...p, {...base, placedStart: slot}]);
+    }
     setNewTitle("");
   };
   const updateTask = (id, patch) => setTasksAndSave(p => p.map(t => t.id===id ? {...t,...patch} : t));
   const removeTask = id => { setTasksAndSave(p => p.filter(t => t.id!==id)); if(selectedId===id) setSelectedId(null); };
 
-  const pomoLayout = useCallback((durationMin) => {
-    const { focus, short, long, cycle } = pomo;
-    const segs = [];
-    let remaining = durationMin, cursor = 0, pomoCount = 0;
-    while (remaining > 0) {
-      const work = Math.min(focus, remaining);
-      segs.push({ type:"focus", start:cursor, len:work });
-      cursor += work; remaining -= work; pomoCount += 1;
-      if (remaining > 0) {
-        const isLong = pomoCount % cycle === 0;
-        const brk = isLong ? long : short;
-        segs.push({ type: isLong?"long":"short", start:cursor, len:brk });
-        cursor += brk;
-      }
-    }
-    return { segs, total:cursor, pomoCount };
-  }, [pomo]);
+  // later → today（末尾に配置） / today → later（配置解除）
+  const moveToToday = id => setTasksAndSave(p=>{
+    const t = p.find(x=>x.id===id); if(!t) return p;
+    const need = occupiedLen(t);
+    const slot = nextSlotStart(p, need);
+    return p.map(x=>x.id===id?{...x,status:"today",placedStart:slot}:x);
+  });
+  const moveToLater = id => setTasksAndSave(p=>p.map(x=>x.id===id?{...x,status:"later",placedStart:null,lane:0}:x));
 
-  const occupiedLen = useCallback(t => t.usePomo ? pomoLayout(t.duration).total : t.duration, [pomoLayout]);
+  const PX = isMobile ? 1.2 : 1.5;
+  const timelineH = 1440 * PX;
+  const ticks = useMemo(()=>{ const out=[]; for(let i=0;i<=24;i++) out.push(TL_START+i*60); return out; },[]);
+  const placedTasks = useMemo(()=>tasks.filter(t=>t.status==="today"&&t.placedStart!==null&&!t.done).sort((a,b)=>a.placedStart-b.placedStart),[tasks]);
+  const todayTasks = useMemo(()=>tasks.filter(t=>t.status==="today"),[tasks]);
+  const laterTasks = useMemo(()=>tasks.filter(t=>t.status==="later"),[tasks]);
+  const unplaced = useMemo(()=>tasks.filter(t=>t.status==="today"&&t.placedStart===null&&!t.done),[tasks]);
 
-  // ===== 自動配置（同時進行=laneは考慮せず初期は重ねない） =====
-  const schedule = useCallback(() => {
-    const wins = windows.map(w=>({start:toMin(w.start),end:toMin(w.end)})).filter(w=>w.end>w.start).sort((a,b)=>a.start-b.start);
-    if (!wins.length) return;
-    const placed = {}, occupied = [];
-    tasks.filter(t=>t.fixed&&t.fixedStart&&!t.done).forEach(t => {
-      const s = toMin(t.fixedStart);
-      placed[t.id] = s;
-      occupied.push({ start:s, end:s+occupiedLen(t) });
-    });
-    tasks.filter(t=>!t.done&&!(t.fixed&&t.fixedStart))
-      .sort((a,b)=>{ const pw=PRIORITY[a.priority].weight-PRIORITY[b.priority].weight; return pw!==0?pw:b.duration-a.duration; })
-      .forEach(t => {
-        const need = occupiedLen(t);
-        let best = null;
-        for (const w of wins) {
-          const cands = [w.start,...occupied.map(o=>o.end)].filter(s=>s>=w.start&&s+need<=w.end).sort((a,b)=>a-b);
-          for (const s of cands) {
-            const inWin = wins.some(w=>s>=w.start&&s+need<=w.end);
-            const free = !occupied.some(o=>s<o.end&&s+need>o.start);
-            if (inWin&&free) { best=s; break; }
-          }
-          if (best!==null) break;
-        }
-        if (best!==null) { placed[t.id]=best; occupied.push({start:best,end:best+need}); occupied.sort((a,b)=>a.start-b.start); }
-        else placed[t.id]=null;
-      });
-    const next = tasks.map(t => t.done ? t : {...t, placedStart: placed[t.id]??null, lane:0});
-    setTasksAndSave(() => next);
-    setScheduled(true);
-    if (isMobile) setMobileTab("timeline");
-  }, [tasks, windows, occupiedLen, setTasksAndSave, isMobile]);
-
-  const range = useMemo(() => {
-    const wins = windows.map(w=>({s:toMin(w.start),e:toMin(w.end)})).filter(w=>w.e>w.s);
-    if (!wins.length) return {start:540,end:1080};
-    return {start:Math.min(...wins.map(w=>w.s)),end:Math.max(...wins.map(w=>w.e))};
-  }, [windows]);
-  const PX = isMobile ? 1.5 : 1.8;
-  const timelineH = (range.end - range.start) * PX;
-  const ticks = useMemo(() => {
-    const out=[];
-    for(let h=Math.floor(range.start/60);h<=Math.ceil(range.end/60);h++) out.push(h*60);
-    return out.filter(m=>m>=range.start&&m<=range.end);
-  }, [range]);
-  const windowBands = useMemo(()=>windows.map(w=>({s:toMin(w.start),e:toMin(w.end)})).filter(w=>w.e>w.s),[windows]);
-  const placedTasks = useMemo(()=>tasks.filter(t=>t.placedStart!==null&&!t.done).sort((a,b)=>a.placedStart-b.placedStart),[tasks]);
-  const unplaced = useMemo(()=>tasks.filter(t=>t.placedStart===null&&!t.done&&scheduled),[tasks,scheduled]);
-
-  // 同一レーン内のみ重複検出
   const conflicts = useMemo(()=>{
     const set=new Set();
     for(let i=0;i<placedTasks.length;i++) for(let j=i+1;j<placedTasks.length;j++){
@@ -255,17 +249,17 @@ function DailyFlow() {
     }
     return set;
   }, [placedTasks, occupiedLen]);
-
   const maxLane = useMemo(()=>Math.max(0,...placedTasks.map(t=>t.lane||0)),[placedTasks]);
-  const totalPomos = useMemo(()=>tasks.filter(t=>!t.done&&t.usePomo).reduce((s,t)=>s+pomoLayout(t.duration).pomoCount,0),[tasks,pomoLayout]);
+  const laneCount = maxLane + 1;
+  const totalPomos = useMemo(()=>todayTasks.filter(t=>!t.done&&t.usePomo).reduce((s,t)=>s+pomoLayout(t.duration).pomoCount,0),[todayTasks,pomoLayout]);
+  const capacity = useMemo(()=>windowBands.reduce((s,w)=>s+(w.e-w.s),0),[windowBands]);
+  const totalMin = useMemo(()=>todayTasks.filter(t=>!t.done).reduce((s,t)=>s+occupiedLen(t),0),[todayTasks,occupiedLen]);
 
-  // ===== ドラッグ =====
   const drag = useRef(null);
   const onDown = (e,t) => {
-    e.preventDefault();
-    setSelectedId(t.id);
+    e.preventDefault(); setSelectedId(t.id);
     const y = e.touches?e.touches[0].clientY:e.clientY;
-    drag.current={id:t.id,startY:y,orig:t.placedStart,moved:false};
+    drag.current={id:t.id,startY:y,orig:t.placedStart};
     window.addEventListener("mousemove",onMove);window.addEventListener("mouseup",onUp);
     window.addEventListener("touchmove",onMove,{passive:false});window.addEventListener("touchend",onUp);
   };
@@ -274,8 +268,7 @@ function DailyFlow() {
     if(e.cancelable) e.preventDefault();
     const y=e.touches?e.touches[0].clientY:e.clientY;
     const d=Math.round((y-drag.current.startY)/PX);
-    if(Math.abs(d)>=1) drag.current.moved=true;
-    let ns=Math.max(range.start,Math.min(range.end-5,drag.current.orig+d));
+    let ns=Math.max(TL_START,Math.min(TL_END-5,drag.current.orig+d));
     updateTask(drag.current.id,{placedStart:ns});
   };
   const onUp = () => {
@@ -283,33 +276,24 @@ function DailyFlow() {
       const id=drag.current.id;
       setTasksAndSave(p=>p.map(t=>{
         if(t.id!==id||t.placedStart===null) return t;
-        let s=t.placedStart;
-        const need=t.usePomo?pomoLayout(t.duration).total:t.duration;
-        if(s+need>range.end) s=range.end-need;
-        return {...t,placedStart:Math.max(range.start,s)};
+        let s=t.placedStart; const need=occupiedLen(t);
+        if(s+need>TL_END) s=TL_END-need;
+        return {...t,placedStart:Math.max(TL_START,s)};
       }));
     }
     drag.current=null;
     window.removeEventListener("mousemove",onMove);window.removeEventListener("mouseup",onUp);
     window.removeEventListener("touchmove",onMove);window.removeEventListener("touchend",onUp);
   };
-
-  // 選択タスクの時刻を±分動かす
   const nudge = (id, delta) => setTasksAndSave(p=>p.map(t=>{
     if(t.id!==id||t.placedStart===null) return t;
-    const need=t.usePomo?pomoLayout(t.duration).total:t.duration;
-    let s=Math.max(range.start,Math.min(range.end-need,t.placedStart+delta));
+    const need=occupiedLen(t);
+    let s=Math.max(TL_START,Math.min(TL_END-need,t.placedStart+delta));
     return {...t,placedStart:s};
   }));
-  // 選択タスクのレーン変更（同時進行）
   const setLane = (id, lane) => setTasksAndSave(p=>p.map(t=>t.id===id?{...t,lane}:t));
 
-  const stats = useMemo(()=>{
-    const active=tasks.filter(t=>!t.done);
-    return { totalMin:active.reduce((s,t)=>s+occupiedLen(t),0), capacity:windowBands.reduce((s,w)=>s+(w.e-w.s),0), count:active.length, done:tasks.filter(t=>t.done).length };
-  },[tasks,windowBands,occupiedLen]);
-
-  const nowMin = useMemo(()=>{const d=new Date();return d.getHours()*60+d.getMinutes();},[]);
+  const nowMin = useMemo(()=>{const d=new Date();return toTL(d.getHours()*60+d.getMinutes());},[]);
 
   const startTimer = t => setTimer({taskId:t.id,title:t.title,phase:"focus",secs:pomo.focus*60,total:pomo.focus*60,pomoDone:0,paused:false});
   useEffect(()=>{
@@ -328,21 +312,18 @@ function DailyFlow() {
     return()=>clearInterval(iv);
   },[timer,pomo]);
 
-  // Enter処理（変換中は無視）
   const onTitleKeyDown = e => {
     if (e.key !== "Enter") return;
-    if (isComposing || e.nativeEvent.isComposing) return; // 変換確定のEnterは送信しない
-    addTask();
+    if (isComposing || e.nativeEvent.isComposing) return;
+    addTask("today");
   };
 
   if (loading) return (
     <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",flexDirection:"column",gap:16,fontFamily:"'Zen Maru Gothic',sans-serif",color:"#B79C92"}}>
-      <div style={{fontSize:48}}>🍅</div>
-      <div style={{fontSize:16}}>DailyFlow を読み込み中...</div>
+      <div style={{fontSize:48}}>🍅</div><div style={{fontSize:16}}>DailyFlow を読み込み中...</div>
     </div>
   );
 
-  // ===== 編集パネル =====
   const EditPanel = (
     <section style={S.panel}>
       <h2 style={S.h2}>🍅 ポモドーロ設定</h2>
@@ -358,8 +339,8 @@ function DailyFlow() {
         <button style={S.preset} onClick={()=>setPomoAndSave({focus:50,short:10,long:20,cycle:2})}>集中型 50/10</button>
         <button style={S.preset} onClick={()=>setPomoAndSave({focus:90,short:20,long:30,cycle:2})}>ディープ 90/20</button>
       </div>
-
-      <h2 style={{...S.h2,marginTop:24}}>① 稼働できる時間帯</h2>
+      <h2 style={{...S.h2,marginTop:24}}>稼働できる時間帯</h2>
+      <p style={S.note}>この時間帯にタスクが自動で積まれます。7:00より前は翌日として扱われます。</p>
       {windows.map((w,i)=>(
         <div key={i} style={S.winRow}>
           <input type="time" value={w.start} onChange={e=>setWindowsAndSave(windows.map((x,j)=>j===i?{...x,start:e.target.value}:x))} style={S.timeInput}/>
@@ -369,121 +350,152 @@ function DailyFlow() {
         </div>
       ))}
       <button style={S.ghostBtn} onClick={()=>setWindowsAndSave([...windows,{start:"19:00",end:"21:00"}])}>＋ 時間帯を追加</button>
-
-      <h2 style={{...S.h2,marginTop:24}}>② 今日のタスク</h2>
-      <div style={S.addRow}>
-        <input value={newTitle}
-          onChange={e=>setNewTitle(e.target.value)}
-          onCompositionStart={()=>setIsComposing(true)}
-          onCompositionEnd={()=>setIsComposing(false)}
-          onKeyDown={onTitleKeyDown}
-          placeholder="タスクを入力（例: K-POP記事の執筆）" style={S.textInput}/>
-        <button style={S.addBtn} onClick={addTask}>追加</button>
-      </div>
-      <div style={S.taskList}>
-        {tasks.map(t=><TaskCard key={t.id} t={t} onUpdate={updateTask} onRemove={removeTask} pomoLayout={pomoLayout}/>)}
-      </div>
-      <button style={S.primaryBtn} onClick={schedule}>⚡ ポモドーロ単位でタイムラインに配置</button>
     </section>
   );
 
-  // ===== タイムラインパネル =====
-  const laneCount = maxLane + 1;
+  const AddBar = (
+    <div style={S.addRow}>
+      <input value={newTitle}
+        onChange={e=>setNewTitle(e.target.value)}
+        onCompositionStart={()=>setIsComposing(true)}
+        onCompositionEnd={()=>setIsComposing(false)}
+        onKeyDown={onTitleKeyDown}
+        placeholder="タスクを入力（Enterで今日に追加）" style={S.textInput}/>
+      <button style={S.addBtn} onClick={()=>addTask("today")}>今日に追加</button>
+      <button style={S.addLaterBtn} onClick={()=>addTask("later")}>あとで</button>
+    </div>
+  );
+
   const TimelinePanel = (
     <section style={S.panel}>
       <div style={S.tlHeader}>
-        <h2 style={S.h2}>③ タイムライン</h2>
-        {scheduled&&<span style={S.hint}>{isMobile?"タップで選択→±で微調整":"ドラッグ/±で再配置・▶で集中"}</span>}
+        <h2 style={S.h2}>📅 今日のタイムライン</h2>
+        <span style={S.hint}>{isMobile?"タップで選択→±で微調整":"ドラッグ/±で再配置・▶で集中"}</span>
       </div>
-      {!scheduled?(
-        <div style={S.empty}>
-          <div style={{fontSize:40,marginBottom:12}}>🍅</div>
-          タスクと時間帯を入力して<br/>「タイムラインに配置」を押してください
-        </div>
-      ):(
-        <>
-          {unplaced.length>0&&<div style={S.warnBox}>⚠ 稼働枠に収まらないタスクが {unplaced.length} 件（{unplaced.map(t=>t.title).join("、")}）。</div>}
-          {selectedId&&(()=>{
-            const t=tasks.find(x=>x.id===selectedId);
-            if(!t||t.placedStart===null) return null;
-            return (
-              <div style={S.adjustBar}>
-                <span style={S.adjustTitle}>{t.title}</span>
-                <div style={S.adjustRow}>
-                  <span style={{fontSize:11,color:"#A99B92"}}>時刻</span>
-                  <button style={S.adjBtn} onClick={()=>nudge(t.id,-15)}>−15</button>
-                  <button style={S.adjBtn} onClick={()=>nudge(t.id,-5)}>−5</button>
-                  <span style={S.adjVal}>{toHHMM(t.placedStart)}</span>
-                  <button style={S.adjBtn} onClick={()=>nudge(t.id,5)}>＋5</button>
-                  <button style={S.adjBtn} onClick={()=>nudge(t.id,15)}>＋15</button>
-                </div>
-                <div style={S.adjustRow}>
-                  <span style={{fontSize:11,color:"#A99B92"}}>列(同時進行)</span>
-                  {[0,1,2].map(l=>(
-                    <button key={l} style={{...S.laneBtn,background:(t.lane||0)===l?"#5BA199":"#fff",color:(t.lane||0)===l?"#fff":"#9A918C",borderColor:(t.lane||0)===l?"#5BA199":"#E5DDD5"}} onClick={()=>setLane(t.id,l)}>{l+1}列目</button>
-                  ))}
-                </div>
-                <button style={S.adjClose} onClick={()=>setSelectedId(null)}>閉じる</button>
-              </div>
-            );
-          })()}
-          <div style={S.timelineWrap}>
-            <div style={{...S.timeline,height:timelineH}}>
-              {windowBands.map((w,i)=>(
-                <div key={i} style={{position:"absolute",left:54,right:8,top:(w.s-range.start)*PX,height:(w.e-w.s)*PX,background:"repeating-linear-gradient(45deg,#F7F3EF,#F7F3EF 10px,#F2ECE6 10px,#F2ECE6 20px)",borderRadius:10,zIndex:0}}/>
+      {AddBar}
+      {unplaced.length>0&&<div style={S.warnBox}>⚠ 稼働枠に収まらず未配置のタスクが {unplaced.length} 件：{unplaced.map(t=>t.title).join("、")}（ドラッグで空き時間へ移せます）</div>}
+      {selectedId&&(()=>{
+        const t=tasks.find(x=>x.id===selectedId);
+        if(!t||t.placedStart===null) return null;
+        return (
+          <div style={S.adjustBar}>
+            <span style={S.adjustTitle}>{t.title}</span>
+            <div style={S.adjustRow}>
+              <span style={{fontSize:11,color:"#A99B92"}}>時刻</span>
+              <button style={S.adjBtn} onClick={()=>nudge(t.id,-15)}>−15</button>
+              <button style={S.adjBtn} onClick={()=>nudge(t.id,-5)}>−5</button>
+              <span style={S.adjVal}>{toHHMM(t.placedStart)}</span>
+              <button style={S.adjBtn} onClick={()=>nudge(t.id,5)}>＋5</button>
+              <button style={S.adjBtn} onClick={()=>nudge(t.id,15)}>＋15</button>
+            </div>
+            <div style={S.adjustRow}>
+              <span style={{fontSize:11,color:"#A99B92"}}>列(同時進行)</span>
+              {[0,1,2].map(l=>(
+                <button key={l} style={{...S.laneBtn,background:(t.lane||0)===l?"#5BA199":"#fff",color:(t.lane||0)===l?"#fff":"#9A918C",borderColor:(t.lane||0)===l?"#5BA199":"#E5DDD5"}} onClick={()=>setLane(t.id,l)}>{l+1}列</button>
               ))}
-              {ticks.map(m=>(
-                <div key={m} style={{position:"absolute",top:(m-range.start)*PX,left:0,right:0,borderTop:"1px solid #EadFd5",zIndex:1}}>
-                  <span style={S.tickLabel}>{toHHMM(m)}</span>
-                </div>
-              ))}
-              {nowMin>=range.start&&nowMin<=range.end&&(
-                <div style={{position:"absolute",top:(nowMin-range.start)*PX,left:48,right:8,height:2,background:"#E76F87",zIndex:6}}>
-                  <span style={S.nowDot}/>
-                </div>
-              )}
-              {placedTasks.map(t=>{
-                const top=(t.placedStart-range.start)*PX;
-                const p=PALETTE[t.color];
-                const isConf=conflicts.has(t.id);
-                const isSel=selectedId===t.id;
-                const layout=t.usePomo?pomoLayout(t.duration):{segs:[{type:"focus",start:0,len:t.duration}],total:t.duration,pomoCount:0};
-                const lane=t.lane||0;
-                const laneW = `calc((100% - 54px - 8px) / ${laneCount})`;
-                const leftCalc = `calc(54px + ${lane} * (100% - 54px - 8px) / ${laneCount})`;
-                return(
-                  <div key={t.id} className={"block"+(isSel?" selected":"")} onMouseDown={e=>onDown(e,t)} onTouchStart={e=>onDown(e,t)}
-                    style={{position:"absolute",top,left:leftCalc,width:laneW,height:Math.max(layout.total*PX,30),zIndex:isSel?5:3,cursor:"grab",borderRadius:10,
-                      boxShadow:isSel?`0 0 0 2px ${p.bar},0 8px 20px rgba(60,45,40,.2)`:isConf?"0 0 0 2px #E76F87,0 6px 16px rgba(231,111,135,.25)":"0 4px 12px rgba(60,45,40,.08)",overflow:"hidden",background:"#fff",
-                      marginLeft:lane>0?3:0,marginRight:3}}>
-                    {layout.segs.map((seg,si)=>(
-                      <div key={si} style={{position:"absolute",left:0,right:0,top:seg.start*PX,height:seg.len*PX,
-                        background:seg.type==="focus"?p.bg:seg.type==="long"?"#EFEAE4":"#F5F1EC",
-                        borderLeft:`4px solid ${seg.type==="focus"?p.bar:"#D8CFC6"}`,
-                        borderTop:si>0?"1px dashed rgba(0,0,0,.08)":"none"}}>
-                        {seg.type!=="focus"&&seg.len*PX>14&&(
-                          <span style={S.breakLabel}>☕ {seg.type==="long"?"長":""}休憩{seg.len}分</span>
-                        )}
-                      </div>
-                    ))}
-                    <div style={{position:"absolute",left:12,right:6,top:5,color:p.text}}>
-                      <div style={S.blockTitle}>
-                        {t.fixed&&"📌 "}{lane>0&&<span style={S.laneTag}>{lane+1}列</span>}{t.title}
-                        {isConf&&<span style={S.confTag}>重複</span>}
-                      </div>
-                      <div style={S.blockMeta}>{toHHMM(t.placedStart)}–{toHHMM(t.placedStart+layout.total)}{t.usePomo&&layout.pomoCount>0?` ・ ポモ${layout.pomoCount}回`:""}</div>
-                    </div>
-                    {t.usePomo&&(
-                      <button className="ctrl" style={S.playBtn}
-                        onMouseDown={e=>e.stopPropagation()} onTouchStart={e=>e.stopPropagation()}
-                        onClick={e=>{e.stopPropagation();startTimer(t);}}>▶</button>
-                    )}
-                  </div>
-                );
-              })}
+            </div>
+            <div style={S.adjustRow}>
+              <button style={S.moveLaterBtn} onClick={()=>{moveToLater(t.id);setSelectedId(null);}}>→ あとでやるへ移動</button>
+              <button style={S.adjClose} onClick={()=>setSelectedId(null)}>閉じる</button>
             </div>
           </div>
-        </>
+        );
+      })()}
+      <div style={S.timelineWrap}>
+        <div style={{...S.timeline,height:timelineH}}>
+          {/* 稼働時間帯を白く塗る */}
+          {windowBands.map((w,i)=>(
+            <div key={i} style={{position:"absolute",left:52,right:8,top:(w.s-TL_START)*PX,height:(w.e-w.s)*PX,background:"linear-gradient(90deg,#E9F5F1,#F3FAF7)",border:"1.5px solid #9FD3C7",borderLeft:"5px solid #5BA199",borderRadius:8,zIndex:1}}>
+              <span style={S.winTag}>● 稼働時間</span>
+            </div>
+          ))}
+          {ticks.map(m=>{
+            const isNight = (m%1440)<TL_START || (m%1440)>=22*60;
+            return (
+              <div key={m} style={{position:"absolute",top:(m-TL_START)*PX,left:0,right:0,borderTop:"1px solid #EadFd5",zIndex:2}}>
+                <span style={{...S.tickLabel,color:isNight?"#C9A8B0":"#B79C92"}}>{toHHMM(m)}</span>
+              </div>
+            );
+          })}
+          {nowMin>=TL_START&&nowMin<=TL_END&&(
+            <div style={{position:"absolute",top:(nowMin-TL_START)*PX,left:46,right:8,height:2,background:"#E76F87",zIndex:7}}>
+              <span style={S.nowDot}/>
+            </div>
+          )}
+          {placedTasks.map(t=>{
+            const top=(t.placedStart-TL_START)*PX;
+            const p=PALETTE[t.color];
+            const isConf=conflicts.has(t.id);
+            const isSel=selectedId===t.id;
+            const layout=t.usePomo?pomoLayout(t.duration):{segs:[{type:"focus",start:0,len:t.duration}],total:t.duration,pomoCount:0};
+            const lane=t.lane||0;
+            const laneW = `calc((100% - 52px - 8px) / ${laneCount})`;
+            const leftCalc = `calc(52px + ${lane} * (100% - 52px - 8px) / ${laneCount})`;
+            return(
+              <div key={t.id} className={"block"+(isSel?" selected":"")} onMouseDown={e=>onDown(e,t)} onTouchStart={e=>onDown(e,t)}
+                style={{position:"absolute",top,left:leftCalc,width:laneW,height:Math.max(layout.total*PX,28),zIndex:isSel?6:4,cursor:"grab",borderRadius:10,
+                  boxShadow:isSel?`0 0 0 2px ${p.bar},0 8px 20px rgba(60,45,40,.2)`:isConf?"0 0 0 2px #E76F87,0 6px 16px rgba(231,111,135,.25)":"0 4px 12px rgba(60,45,40,.1)",overflow:"hidden",background:"#fff",marginRight:3}}>
+                {layout.segs.map((seg,si)=>(
+                  <div key={si} style={{position:"absolute",left:0,right:0,top:seg.start*PX,height:seg.len*PX,
+                    background:seg.type==="focus"?p.bg:seg.type==="long"?"#EFEAE4":"#F5F1EC",
+                    borderLeft:`4px solid ${seg.type==="focus"?p.bar:"#D8CFC6"}`,
+                    borderTop:si>0?"1px dashed rgba(0,0,0,.08)":"none"}}>
+                    {seg.type!=="focus"&&seg.len*PX>13&&(<span style={S.breakLabel}>☕{seg.len}分</span>)}
+                  </div>
+                ))}
+                <div style={{position:"absolute",left:11,right:6,top:5,color:p.text}}>
+                  <div style={S.blockTitle}>
+                    {t.fixed&&"📌 "}{lane>0&&<span style={S.laneTag}>{lane+1}列</span>}{t.title}
+                    {isConf&&<span style={S.confTag}>重複</span>}
+                  </div>
+                  <div style={S.blockMeta}>{toHHMM(t.placedStart)}–{toHHMM(t.placedStart+layout.total)}{t.usePomo&&layout.pomoCount>0?` ・ ポモ${layout.pomoCount}回`:""}</div>
+                </div>
+                {t.usePomo&&(<button className="ctrl" style={S.playBtn} onMouseDown={e=>e.stopPropagation()} onTouchStart={e=>e.stopPropagation()} onClick={e=>{e.stopPropagation();startTimer(t);}}>▶</button>)}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+
+  const LaterPanel = (
+    <section style={S.panel}>
+      <div style={S.tlHeader}>
+        <h2 style={S.h2}>🗂 あとでやる</h2>
+        <span style={S.hint}>今日はやらないがストックしておくタスク</span>
+      </div>
+      {AddBar}
+      {laterTasks.length===0 ? (
+        <div style={S.empty}><div style={{fontSize:36,marginBottom:10}}>🗂</div>あとでやるタスクはありません<br/>「あとで」ボタンで追加できます</div>
+      ) : (
+        <div style={S.taskList}>
+          {laterTasks.map(t=>(
+            <div key={t.id} style={{...S.laterCard,borderLeft:`4px solid ${PALETTE[t.color].bar}`,opacity:t.done?.5:1}}>
+              <button style={{...S.check,background:t.done?PALETTE[t.color].bar:"transparent",borderColor:PALETTE[t.color].bar}} onClick={()=>updateTask(t.id,{done:!t.done})}>{t.done?"✓":""}</button>
+              <div style={{flex:1,minWidth:0}}>
+                <input value={t.title} onChange={e=>updateTask(t.id,{title:e.target.value})} style={{...S.cardTitle,marginBottom:4,textDecoration:t.done?"line-through":"none"}}/>
+                <div style={{fontSize:11.5,color:"#A99B92"}}>目安 {fmtDur(t.duration)}{t.usePomo?` ・ ポモ${pomoLayout(t.duration).pomoCount}回`:""}</div>
+              </div>
+              <button style={S.toTodayBtn} onClick={()=>{moveToToday(t.id);if(isMobile)setTab("timeline");}}>今日やる →</button>
+              <button style={S.del} onClick={()=>removeTask(t.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+
+  const TodayListPanel = (
+    <section style={S.panel}>
+      <div style={S.tlHeader}><h2 style={S.h2}>✏️ 今日のタスク</h2></div>
+      {AddBar}
+      {todayTasks.length===0 ? (
+        <div style={S.empty}><div style={{fontSize:36,marginBottom:10}}>📝</div>タスクを追加してください</div>
+      ) : (
+        <div style={S.taskList}>
+          {todayTasks.map(t=><TaskCard key={t.id} t={t} onUpdate={updateTask} onRemove={removeTask} pomoLayout={pomoLayout} onLater={()=>moveToLater(t.id)}/>)}
+        </div>
       )}
     </section>
   );
@@ -497,11 +509,11 @@ function DailyFlow() {
         </div>
         <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6}}>
           <div style={S.statBar}>
-            <Stat label="タスク" value={stats.count}/>
+            <Stat label="今日" value={todayTasks.filter(t=>!t.done).length}/>
+            <Stat label="あとで" value={laterTasks.filter(t=>!t.done).length}/>
             <Stat label="ポモ" value={totalPomos+"回"}/>
-            <Stat label="占有" value={fmtDur(stats.totalMin)} warn={stats.totalMin>stats.capacity}/>
-            <Stat label="稼働枠" value={fmtDur(stats.capacity)}/>
-            <Stat label="完了" value={stats.done}/>
+            <Stat label="占有" value={fmtDur(totalMin)} warn={totalMin>capacity}/>
+            <Stat label="稼働枠" value={fmtDur(capacity)}/>
           </div>
           <div style={S.saveStatus}>
             {saveStatus==="saving"&&<span style={{color:"#B79C92"}}>⟳ 保存中...</span>}
@@ -511,19 +523,21 @@ function DailyFlow() {
         </div>
       </header>
 
+      <div style={S.tabBar}>
+        <button style={{...S.tabBtn,...(tab==="timeline"?S.tabActive:{})}} onClick={()=>setTab("timeline")}>📅 タイムライン</button>
+        {isMobile&&<button style={{...S.tabBtn,...(tab==="today"?S.tabActive:{})}} onClick={()=>setTab("today")}>✏️ 今日</button>}
+        <button style={{...S.tabBtn,...(tab==="later"?S.tabActive:{})}} onClick={()=>setTab("later")}>🗂 あとでやる{laterTasks.length>0?`(${laterTasks.filter(t=>!t.done).length})`:""}</button>
+        <button style={{...S.tabBtn,...(tab==="edit"?S.tabActive:{})}} onClick={()=>setTab("edit")}>⚙️ 設定</button>
+      </div>
+
       {isMobile ? (
-        <>
-          <div style={S.tabBar}>
-            <button style={{...S.tabBtn,...(mobileTab==="edit"?S.tabActive:{})}} onClick={()=>setMobileTab("edit")}>✏️ 編集</button>
-            <button style={{...S.tabBtn,...(mobileTab==="timeline"?S.tabActive:{})}} onClick={()=>setMobileTab("timeline")}>📅 タイムライン</button>
-          </div>
-          {mobileTab==="edit" ? EditPanel : TimelinePanel}
-        </>
+        tab==="timeline" ? TimelinePanel :
+        tab==="today" ? TodayListPanel :
+        tab==="later" ? LaterPanel : EditPanel
       ) : (
-        <div style={S.grid}>
-          {EditPanel}
-          {TimelinePanel}
-        </div>
+        tab==="later" ? <div style={S.grid}>{LaterPanel}{TodayListPanel}</div> :
+        tab==="edit" ? <div style={S.grid}>{EditPanel}{TodayListPanel}</div> :
+        <div style={S.grid}>{TodayListPanel}{TimelinePanel}</div>
       )}
 
       {timer&&(
@@ -535,19 +549,15 @@ function DailyFlow() {
           <div style={S.timerTitle}>{timer.title}</div>
           <div style={S.timerClock}>{String(Math.floor(timer.secs/60)).padStart(2,"0")}:{String(timer.secs%60).padStart(2,"0")}</div>
           <div style={S.timerBarBg}><div style={{...S.timerBarFill,width:`${(1-timer.secs/timer.total)*100}%`}}/></div>
-          <div style={S.timerFooter}>
-            <span>完了: {timer.pomoDone} 🍅</span>
-            <button style={S.timerPause} onClick={()=>setTimer(tm=>({...tm,paused:!tm.paused}))}>{timer.paused?"▶ 再開":"⏸ 停止"}</button>
-          </div>
+          <div style={S.timerFooter}><span>完了: {timer.pomoDone} 🍅</span><button style={S.timerPause} onClick={()=>setTimer(tm=>({...tm,paused:!tm.paused}))}>{timer.paused?"▶ 再開":"⏸ 停止"}</button></div>
         </div>
       )}
-
-      <footer style={S.footer}>DailyFlow — クラウド同期 × ポモドーロ × タイムブロッキング</footer>
+      <footer style={S.footer}>DailyFlow — クラウド同期 × ポモドーロ × 24時間タイムライン</footer>
     </div>
   );
 }
 
-function TaskCard({t,onUpdate,onRemove,pomoLayout}){
+function TaskCard({t,onUpdate,onRemove,pomoLayout,onLater}){
   const [editDur,setEditDur]=useState(false);
   const p=PALETTE[t.color];
   const pc=t.usePomo?pomoLayout(t.duration).pomoCount:0;
@@ -563,26 +573,21 @@ function TaskCard({t,onUpdate,onRemove,pomoLayout}){
               <button key={k} onClick={()=>onUpdate(t.id,{priority:k})} style={{...S.prioBtn,background:t.priority===k?v.color:"#fff",color:t.priority===k?"#fff":"#9A918C",borderColor:t.priority===k?v.color:"#E5DDD5"}}>{v.label}</button>
             ))}
           </div>
-          {/* 所要時間：±ボタン付き */}
           <div style={S.durControl}>
-            <button style={S.durStep} onClick={()=>setDur(t.duration-60)} title="1時間減らす">−1h</button>
-            <button style={S.durStep} onClick={()=>setDur(t.duration-15)} title="15分減らす">−15</button>
+            <button style={S.durStep} onClick={()=>setDur(t.duration-60)}>−1h</button>
+            <button style={S.durStep} onClick={()=>setDur(t.duration-15)}>−15</button>
             {editDur?(
               <input type="number" min={5} step={5} value={t.duration} autoFocus onChange={e=>setDur(Number(e.target.value)||5)} onBlur={()=>setEditDur(false)} onKeyDown={e=>e.key==="Enter"&&setEditDur(false)} style={S.durInput}/>
             ):(
-              <button style={S.durChip} onClick={()=>setEditDur(true)} title="クリックで直接入力">
-                {fmtDur(t.duration)}{t.autoDuration&&<span style={S.autoTag}>自動</span>}
-              </button>
+              <button style={S.durChip} onClick={()=>setEditDur(true)}>{fmtDur(t.duration)}{t.autoDuration&&<span style={S.autoTag}>自動</span>}</button>
             )}
-            <button style={S.durStep} onClick={()=>setDur(t.duration+15)} title="15分増やす">＋15</button>
-            <button style={S.durStep} onClick={()=>setDur(t.duration+60)} title="1時間増やす">＋1h</button>
+            <button style={S.durStep} onClick={()=>setDur(t.duration+15)}>＋15</button>
+            <button style={S.durStep} onClick={()=>setDur(t.duration+60)}>＋1h</button>
           </div>
-          {/* ポモ数：文字で明示 */}
-          <button style={{...S.pomoToggle,background:t.usePomo?"#FDE2E4":"#fff",color:t.usePomo?"#7A2B3D":"#9A918C",borderColor:t.usePomo?"#E76F87":"#E5DDD5"}} onClick={()=>onUpdate(t.id,{usePomo:!t.usePomo})} title="ポモドーロ分割のON/OFF">
-            {t.usePomo?`🍅 ポモ${pc}回`:"🍅 分割OFF"}
-          </button>
-          <button style={{...S.fixBtn,background:t.fixed?"#3C2D2A":"#fff",color:t.fixed?"#fff":"#9A918C"}} onClick={()=>onUpdate(t.id,{fixed:!t.fixed,fixedStart:!t.fixed?t.fixedStart||"13:00":null})} title="開始時刻を固定">📌 固定</button>
+          <button style={{...S.pomoToggle,background:t.usePomo?"#FDE2E4":"#fff",color:t.usePomo?"#7A2B3D":"#9A918C",borderColor:t.usePomo?"#E76F87":"#E5DDD5"}} onClick={()=>onUpdate(t.id,{usePomo:!t.usePomo})}>{t.usePomo?`🍅 ポモ${pc}回`:"🍅 分割OFF"}</button>
+          <button style={{...S.fixBtn,background:t.fixed?"#3C2D2A":"#fff",color:t.fixed?"#fff":"#9A918C"}} onClick={()=>onUpdate(t.id,{fixed:!t.fixed,fixedStart:!t.fixed?t.fixedStart||"13:00":null})}>📌 固定</button>
           {t.fixed&&<input type="time" value={t.fixedStart||"13:00"} onChange={e=>onUpdate(t.id,{fixedStart:e.target.value})} style={S.fixTime}/>}
+          <button style={S.laterMini} onClick={onLater}>🗂 あとで</button>
         </div>
       </div>
       <button style={S.del} onClick={()=>onRemove(t.id)}>✕</button>
@@ -591,42 +596,29 @@ function TaskCard({t,onUpdate,onRemove,pomoLayout}){
 }
 
 function PomoField({label,unit,val,set}){
-  return(
-    <div style={S.pomoField}>
-      <label style={S.pomoLabel}>{label}</label>
-      <div style={S.pomoInputWrap}>
-        <input type="number" min={1} value={val} onChange={e=>set(Math.max(1,Number(e.target.value)||1))} style={S.pomoInput}/>
-        <span style={S.pomoUnit}>{unit}</span>
-      </div>
-    </div>
-  );
+  return(<div style={S.pomoField}><label style={S.pomoLabel}>{label}</label><div style={S.pomoInputWrap}><input type="number" min={1} value={val} onChange={e=>set(Math.max(1,Number(e.target.value)||1))} style={S.pomoInput}/><span style={S.pomoUnit}>{unit}</span></div></div>);
 }
-
 function Stat({label,value,warn}){
-  return(
-    <div style={S.statItem}>
-      <div style={{...S.statVal,color:warn?"#E76F87":"#3C2D2A"}}>{value}</div>
-      <div style={S.statLabel}>{label}</div>
-    </div>
-  );
+  return(<div style={S.statItem}><div style={{...S.statVal,color:warn?"#E76F87":"#3C2D2A"}}>{value}</div><div style={S.statLabel}>{label}</div></div>);
 }
 
 const S={
   root:{fontFamily:"'Zen Maru Gothic',sans-serif",background:"radial-gradient(1200px 600px at 80% -10%,#FCEEF0 0%,transparent 60%),radial-gradient(900px 500px at -10% 110%,#E6F0EC 0%,transparent 55%),#FBF8F4",minHeight:"100vh",color:"#3C2D2A",padding:"20px clamp(12px,4vw,48px)"},
-  header:{display:"flex",justifyContent:"space-between",alignItems:"flex-end",flexWrap:"wrap",gap:14,marginBottom:16},
+  header:{display:"flex",justifyContent:"space-between",alignItems:"flex-end",flexWrap:"wrap",gap:14,marginBottom:14},
   kicker:{fontFamily:"'Outfit',sans-serif",fontSize:11,letterSpacing:"0.22em",color:"#B79C92",fontWeight:600},
   title:{fontFamily:"'Outfit',sans-serif",fontSize:"clamp(28px,5vw,52px)",fontWeight:800,margin:"2px 0 0",letterSpacing:"-0.02em"},
   statBar:{display:"flex",gap:2,background:"rgba(255,255,255,.7)",backdropFilter:"blur(8px)",border:"1px solid #EFE6DD",borderRadius:14,padding:"8px 6px",boxShadow:"0 8px 24px rgba(120,90,70,.07)"},
-  statItem:{textAlign:"center",padding:"0 7px",minWidth:46},
+  statItem:{textAlign:"center",padding:"0 7px",minWidth:44},
   statVal:{fontFamily:"'Outfit',sans-serif",fontSize:15,fontWeight:800},
   statLabel:{fontSize:9.5,color:"#A99B92",marginTop:2},
   saveStatus:{fontSize:12,height:16},
-  tabBar:{display:"flex",gap:8,marginBottom:14},
-  tabBtn:{flex:1,fontFamily:"inherit",fontSize:14,fontWeight:700,padding:"11px",borderRadius:12,border:"1px solid #EFE6DD",background:"rgba(255,255,255,.6)",color:"#A8917F",cursor:"pointer"},
+  tabBar:{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"},
+  tabBtn:{flex:"1 1 auto",fontFamily:"inherit",fontSize:13.5,fontWeight:700,padding:"10px 8px",borderRadius:12,border:"1px solid #EFE6DD",background:"rgba(255,255,255,.6)",color:"#A8917F",cursor:"pointer",whiteSpace:"nowrap"},
   tabActive:{background:"#3C2D2A",color:"#fff",borderColor:"#3C2D2A"},
   grid:{display:"grid",gridTemplateColumns:"minmax(340px,1fr) minmax(340px,1.05fr)",gap:20,alignItems:"start"},
   panel:{background:"rgba(255,255,255,.8)",backdropFilter:"blur(10px)",border:"1px solid #EFE6DD",borderRadius:20,padding:"18px clamp(12px,2vw,22px)",boxShadow:"0 12px 40px rgba(120,90,70,.08)"},
   h2:{fontSize:15,fontWeight:700,margin:"0 0 12px",display:"flex",alignItems:"center",gap:8},
+  note:{fontSize:11.5,color:"#A99B92",marginBottom:10,lineHeight:1.6},
   pomoGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:7},
   pomoField:{display:"flex",flexDirection:"column",gap:4},
   pomoLabel:{fontSize:10.5,color:"#A99B92"},
@@ -640,11 +632,13 @@ const S={
   tilde:{color:"#B79C92"},
   iconBtn:{border:"none",background:"#F3ECE5",color:"#9A918C",borderRadius:8,width:30,height:30,cursor:"pointer"},
   ghostBtn:{width:"100%",border:"1.5px dashed #DCD0C5",background:"transparent",color:"#A8917F",padding:"9px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"inherit",marginTop:2},
-  addRow:{display:"flex",gap:8,marginBottom:14},
-  textInput:{flex:1,fontFamily:"inherit",fontSize:14,padding:"11px 14px",border:"1px solid #E5DDD5",borderRadius:12,background:"#fff",color:"#3C2D2A"},
-  addBtn:{fontFamily:"inherit",fontWeight:700,background:"#3C2D2A",color:"#fff",border:"none",borderRadius:12,padding:"0 18px",cursor:"pointer"},
+  addRow:{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"},
+  textInput:{flex:"1 1 160px",fontFamily:"inherit",fontSize:14,padding:"11px 14px",border:"1px solid #E5DDD5",borderRadius:12,background:"#fff",color:"#3C2D2A"},
+  addBtn:{fontFamily:"inherit",fontWeight:700,background:"#3C2D2A",color:"#fff",border:"none",borderRadius:12,padding:"0 16px",cursor:"pointer",fontSize:13.5},
+  addLaterBtn:{fontFamily:"inherit",fontWeight:700,background:"#fff",color:"#7A6A60",border:"1px solid #E5DDD5",borderRadius:12,padding:"9px 14px",cursor:"pointer",fontSize:13},
   taskList:{display:"flex",flexDirection:"column",gap:9},
   card:{display:"flex",gap:10,alignItems:"flex-start",background:"#fff",border:"1px solid #EFE6DD",borderRadius:14,padding:"12px 12px 12px 14px"},
+  laterCard:{display:"flex",gap:10,alignItems:"center",background:"#fff",border:"1px solid #EFE6DD",borderRadius:14,padding:"12px 12px 12px 14px"},
   check:{flexShrink:0,width:22,height:22,borderRadius:7,border:"2px solid",color:"#fff",cursor:"pointer",marginTop:2,fontSize:12,lineHeight:1},
   cardTitle:{width:"100%",border:"none",background:"transparent",fontFamily:"inherit",fontSize:14.5,fontWeight:700,color:"#3C2D2A",padding:0,marginBottom:8,outline:"none"},
   cardMeta:{display:"flex",flexWrap:"wrap",alignItems:"center",gap:6},
@@ -658,11 +652,12 @@ const S={
   pomoToggle:{border:"1px solid",borderRadius:8,padding:"5px 10px",cursor:"pointer",fontFamily:"inherit",fontSize:11.5,fontWeight:700},
   fixBtn:{border:"1px solid #E5DDD5",borderRadius:8,padding:"5px 10px",cursor:"pointer",fontFamily:"inherit",fontSize:11.5},
   fixTime:{fontFamily:"'Outfit',sans-serif",fontSize:12.5,padding:"3px 6px",border:"1px solid #E5DDD5",borderRadius:8},
+  laterMini:{border:"1px solid #E5DDD5",background:"#fff",color:"#9A918C",borderRadius:8,padding:"5px 10px",cursor:"pointer",fontFamily:"inherit",fontSize:11.5},
   del:{flexShrink:0,border:"none",background:"transparent",color:"#CDB9AD",cursor:"pointer",fontSize:14},
-  primaryBtn:{width:"100%",marginTop:16,fontFamily:"inherit",fontWeight:700,fontSize:15,color:"#fff",background:"linear-gradient(120deg,#E76F87,#E0A341)",border:"none",borderRadius:14,padding:"14px",cursor:"pointer",boxShadow:"0 10px 24px rgba(231,111,135,.3)"},
+  toTodayBtn:{flexShrink:0,border:"none",background:"#5BA199",color:"#fff",borderRadius:9,padding:"8px 12px",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700},
   tlHeader:{display:"flex",justifyContent:"space-between",alignItems:"baseline",flexWrap:"wrap",gap:8},
   hint:{fontSize:11,color:"#B79C92"},
-  empty:{textAlign:"center",color:"#B79C92",padding:"60px 20px",fontSize:14,lineHeight:1.7},
+  empty:{textAlign:"center",color:"#B79C92",padding:"50px 20px",fontSize:14,lineHeight:1.7},
   warnBox:{background:"#FDE2E4",color:"#7A2B3D",borderRadius:12,padding:"10px 14px",fontSize:12.5,marginBottom:12,lineHeight:1.6},
   adjustBar:{background:"#fff",border:"1px solid #EFE6DD",borderRadius:14,padding:"12px 14px",marginBottom:12,boxShadow:"0 6px 18px rgba(60,45,40,.08)"},
   adjustTitle:{fontSize:13,fontWeight:700,display:"block",marginBottom:8,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
@@ -670,17 +665,19 @@ const S={
   adjBtn:{border:"1px solid #E5DDD5",background:"#FBF8F4",color:"#3C2D2A",borderRadius:8,padding:"6px 10px",cursor:"pointer",fontFamily:"'Outfit',sans-serif",fontSize:13,fontWeight:600},
   adjVal:{fontFamily:"'Outfit',sans-serif",fontSize:16,fontWeight:800,minWidth:54,textAlign:"center"},
   laneBtn:{border:"1px solid",borderRadius:8,padding:"6px 10px",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700},
+  moveLaterBtn:{border:"1px solid #E5DDD5",background:"#fff",color:"#7A6A60",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontFamily:"inherit",fontSize:12},
   adjClose:{border:"none",background:"#F3ECE5",color:"#9A918C",borderRadius:8,padding:"6px 14px",cursor:"pointer",fontFamily:"inherit",fontSize:12},
-  timelineWrap:{maxHeight:"68vh",overflowY:"auto",paddingRight:4},
+  timelineWrap:{maxHeight:"66vh",overflowY:"auto",paddingRight:4},
   timeline:{position:"relative",marginTop:4},
-  tickLabel:{position:"absolute",left:0,top:-8,fontSize:11,fontFamily:"'Outfit',sans-serif",color:"#B79C92",background:"#FBF8F4",paddingRight:4},
+  tickLabel:{position:"absolute",left:0,top:-8,fontSize:11,fontFamily:"'Outfit',sans-serif",background:"#FBF8F4",paddingRight:4},
   nowDot:{position:"absolute",left:-5,top:-4,width:10,height:10,borderRadius:"50%",background:"#E76F87"},
+  winTag:{position:"absolute",left:10,top:5,fontSize:11,fontWeight:700,color:"#3E7E74",fontFamily:"'Zen Maru Gothic',sans-serif",letterSpacing:".05em",background:"rgba(255,255,255,.7)",borderRadius:6,padding:"1px 7px"},
   blockTitle:{fontSize:12.5,fontWeight:700,display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
   laneTag:{fontSize:9,background:"#5BA199",color:"#fff",borderRadius:4,padding:"1px 4px",flexShrink:0},
   confTag:{fontSize:9.5,background:"#E76F87",color:"#fff",borderRadius:4,padding:"1px 5px"},
   blockMeta:{fontSize:10,fontFamily:"'Outfit',sans-serif",opacity:0.8,marginTop:2},
-  breakLabel:{fontSize:9,color:"#A8978B",fontFamily:"'Outfit',sans-serif",position:"absolute",right:8,top:"50%",transform:"translateY(-50%)"},
-  playBtn:{position:"absolute",right:6,bottom:6,width:26,height:26,borderRadius:"50%",border:"none",background:"rgba(255,255,255,.9)",color:"#E76F87",cursor:"pointer",fontSize:10,boxShadow:"0 2px 8px rgba(0,0,0,.15)",zIndex:4},
+  breakLabel:{fontSize:9,color:"#A8978B",fontFamily:"'Outfit',sans-serif",position:"absolute",right:6,top:"50%",transform:"translateY(-50%)"},
+  playBtn:{position:"absolute",right:6,bottom:6,width:26,height:26,borderRadius:"50%",border:"none",background:"rgba(255,255,255,.9)",color:"#E76F87",cursor:"pointer",fontSize:10,boxShadow:"0 2px 8px rgba(0,0,0,.15)",zIndex:5},
   timerCard:{position:"fixed",right:16,bottom:16,width:240,borderRadius:20,padding:16,color:"#fff",boxShadow:"0 16px 48px rgba(0,0,0,.3)",zIndex:50,animation:"pulse 4s ease-in-out infinite"},
   timerTop:{display:"flex",justifyContent:"space-between",alignItems:"center"},
   timerPhase:{fontSize:13,fontWeight:700,letterSpacing:".04em"},
