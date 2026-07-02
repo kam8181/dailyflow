@@ -190,21 +190,23 @@ function DailyFlow() {
     .filter(w=>w.e>w.s)
     .sort((a,b)=>a.s-b.s),[windows]);
 
-  // ===== 新規タスクを稼働時間帯の末尾に積む =====
+  // ===== 新規タスクを稼働時間帯の末尾に積む（枠を超えても必ず配置） =====
   const nextSlotStart = useCallback((currentTasks, need) => {
-    if (!windowBands.length) return null;
-    // 既存の today 配置ブロック(lane0のみ基準)から埋まっている終端を求める
+    if (!windowBands.length) return TL_START;
     const placed = currentTasks.filter(t=>t.status==="today"&&t.placedStart!==null&&!t.done&&(t.lane||0)===0)
       .map(t=>({s:t.placedStart,e:t.placedStart+occupiedLen(t)}));
+    // 各稼働枠で空きを探す
     for (const w of windowBands) {
-      // この枠内で埋まっている最後の終端
       let cursor = w.s;
       const inWin = placed.filter(p=>p.e>w.s&&p.s<w.e).sort((a,b)=>a.s-b.s);
       inWin.forEach(p=>{ if(p.e>cursor) cursor = Math.max(cursor,p.e); });
       if (cursor + need <= w.e) return cursor;
     }
-    // どこにも入らなければ最後の枠の末尾（はみ出し扱い）
-    return null;
+    // 枠に収まらない場合：全既存タスクの最後尾（なければ最初の枠の頭）に連続配置
+    if (placed.length > 0) {
+      return Math.max(...placed.map(p=>p.e));
+    }
+    return windowBands[0].s;
   }, [windowBands, occupiedLen]);
 
   const addTask = (status="today") => {
@@ -373,7 +375,6 @@ function DailyFlow() {
         <span style={S.hint}>{isMobile?"タップで選択→±で微調整":"ドラッグ/±で再配置・▶で集中"}</span>
       </div>
       {AddBar}
-      {unplaced.length>0&&<div style={S.warnBox}>⚠ 稼働枠に収まらず未配置のタスクが {unplaced.length} 件：{unplaced.map(t=>t.title).join("、")}（ドラッグで空き時間へ移せます）</div>}
       {selectedId&&(()=>{
         const t=tasks.find(x=>x.id===selectedId);
         if(!t||t.placedStart===null) return null;
